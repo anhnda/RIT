@@ -12,7 +12,6 @@ This repository contains the implementation of **RIT (Reinforcement learning for
 
 **Authors:** Nguyen Hong Quang, Bui Hoang Tu, Peter Petschner, and Duc Anh Nguyen
 
-**Venue:** IEEE Journal of Biomedical and Health Informatics
 
 **Abstract:** We propose RIT, a novel framework that learns task-relevant representations from irregular sequences using a policy-gradient training strategy, enabling optimization without requiring gradients through non-differentiable classifiers such as XGBoost, CatBoost, or TabPFN.
 
