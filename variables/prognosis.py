@@ -1,4 +1,4 @@
-from mimic_sql import oasis
+#from mimic_sql import oasis
 
 
 def getPreIcuLos():
