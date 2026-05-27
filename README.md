@@ -7,7 +7,7 @@ This repository contains the implementation of **PIT: Policy-Gradient Representa
 
 ## Paper Reference
 
-**Title:** Reinforcement Learning for Irregular Temporal Data: A Framework for Acute Kidney Injury Prediction
+**Title:** PIT: Policy-Gradient Representation Learning for Irregular Biomedical Time-Series Signal Processing
 
 **Authors:** Nguyen Hong Quang, Bui Hoang Tu, Peter Petschner, and Duc Anh Nguyen
 
