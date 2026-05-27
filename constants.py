@@ -1,7 +1,7 @@
 from pathlib import Path
 import sys, os
 from secret import MIMIC_PATH_STR, POSTGRESQL_CONNECTION_STRING
-from pandasql import PandaSQL
+#from pandasql import PandaSQL
 
 
 MIMIC_PATH = Path(MIMIC_PATH_STR)
