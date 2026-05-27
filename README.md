@@ -569,4 +569,4 @@ MIT License - see LICENSE file for details.
 
 ## Acknowledgments
 
-This work was supported by [Funding details]. We thank the MIMIC-IV team for making the dataset publicly available.
+This work was supported by [Funding details]. 
