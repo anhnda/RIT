@@ -1,14 +1,14 @@
 from pathlib import Path
-from pandasql import PandaSQL
 import sys, os
 from secret import MIMIC_PATH_STR, POSTGRESQL_CONNECTION_STRING
+from pandasql import PandaSQL
 
 
 MIMIC_PATH = Path(MIMIC_PATH_STR)
 PT = os.path.dirname(os.path.abspath(__file__))
 
 # temporary path
-TEMP_PATH = Path( "%s/tmp"  %PT)
+TEMP_PATH = Path( "%s/data"  %PT)
 TEMP_PATH.mkdir(parents=True, exist_ok=True)
 
 # result path 
@@ -45,8 +45,4 @@ CATEGORICAL_MEASURES = [
 
 TARGET_PATIENT_FILE = "target_patients.csv"
 
-queryPostgresDf = None # PandaSQL(POSTGRESQL_CONNECTION_STRING)
-
-## Archived notebooks
-ARCHIVED_NOTEBOOKS_PATH = Path("archived_notebooks_limited-new")
-ARCHIVED_NOTEBOOKS_PATH.mkdir(parents=True, exist_ok=True)
+queryPostgresDf = None  # set to PandaSQL(POSTGRESQL_CONNECTION_STRING) when live DB is available

@@ -14,6 +14,7 @@ Advantages over ODE-RNN:
 - ✓ Still handles irregular time gaps
 """
 
+import os
 import pandas as pd
 import numpy as np
 import sys
@@ -33,10 +34,7 @@ from sklearn.metrics import (
     auc,
 )
 
-PT = "/Users/anhnd/CodingSpace/Python/PREDKIT"
-if sys.platform != "darwin":
-    PT = "/home/anhnda/PREKIT"
-print(sys.platform, PT)
+PT = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(PT)
 
 from constants import NULLABLE_MEASURES
