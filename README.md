@@ -1,10 +1,9 @@
-# RIT: Reinforcement Learning for Irregular Temporal Data
-
+# PIT: Policy-Gradient Representation Learning for Irregular Biomedical Time-Series Signal Processing
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-This repository contains the implementation of **RIT (Reinforcement learning for Irregular Temporal data)**, a novel framework for predicting Acute Kidney Injury (AKI) in Diabetic Ketoacidosis (DKA) patients using irregular temporal ICU data.
+This repository contains the implementation of **PIT: Policy-Gradient Representation Learning for Irregular Biomedical Time-Series Signal Processing**, a novel framework for predicting Acute Kidney Injury (AKI) in Diabetic Ketoacidosis (DKA) patients using irregular temporal ICU data.
 
 ## Paper Reference
 
@@ -13,7 +12,7 @@ This repository contains the implementation of **RIT (Reinforcement learning for
 **Authors:** Nguyen Hong Quang, Bui Hoang Tu, Peter Petschner, and Duc Anh Nguyen
 
 
-**Abstract:** We propose RIT, a novel framework that learns task-relevant representations from irregular sequences using a policy-gradient training strategy, enabling optimization without requiring gradients through non-differentiable classifiers such as XGBoost, CatBoost, or TabPFN.
+**Abstract:** We propose PIT, a novel framework that learns task-relevant representations from irregular sequences using a policy-gradient training strategy, enabling optimization without requiring gradients through non-differentiable classifiers such as XGBoost, CatBoost, or TabPFN.
 
 ## Key Features
 
@@ -28,11 +27,11 @@ This repository contains the implementation of **RIT (Reinforcement learning for
 | Classifier | Method | AUC-ROC | AUC-PR |
 |------------|--------|---------|--------|
 | **CatBoost** | Baseline | 0.8109 ± 0.0362 | 0.7385 ± 0.046 |
-| | +RIT | **0.8499 ± 0.0294** | **0.7875 ± 0.050** |
+| | +PIT | **0.8499 ± 0.0294** | **0.7875 ± 0.050** |
 | **XGBoost** | Baseline | 0.8121 ± 0.0357 | 0.7400 ± 0.040 |
-| | +RIT | **0.8397 ± 0.0240** | **0.7724 ± 0.039** |
+| | +PIT | **0.8397 ± 0.0240** | **0.7724 ± 0.039** |
 | **TabPFN** | Baseline | 0.8557 ± 0.0267 | 0.8027 ± 0.025 |
-| | +RIT | **0.8655 ± 0.0136** | **0.8112 ± 0.020** |
+| | +PIT | **0.8655 ± 0.0136** | **0.8112 ± 0.020** |
 
 ## Installation
 
@@ -40,8 +39,8 @@ This repository contains the implementation of **RIT (Reinforcement learning for
 
 ```bash
 # Create conda environment
-conda create -n rit python=3.8
-conda activate rit
+conda create -n PIT python=3.8
+conda activate PIT
 
 # Install PyTorch (adjust CUDA version as needed)
 pip install torch torchvision torchaudio
@@ -70,11 +69,11 @@ This implementation uses the **MIMIC-IV** database. You need to:
 ```
 TXGBoost/
 ├── README.md                 # This file
-├── CatBoostRL.py            # CatBoost + RIT (Reinforcement Learning)
+├── CatBoostRL.py            # CatBoost + PIT (Reinforcement Learning)
 ├── CatBoostBase.py          # CatBoost baseline (static + last values)
-├── XGRL.py                  # XGBoost + RIT
+├── XGRL.py                  # XGBoost + PIT
 ├── XGBase.py                # XGBoost baseline
-├── TabPFNRL.py              # TabPFN + RIT
+├── TabPFNRL.py              # TabPFN + PIT
 ├── TabPFNBase.py            # TabPFN baseline
 ├── ExtractFeatureCB.py      # Feature extraction & SHAP analysis
 ├── TimeEmbedding.py         # Time-embedded RNN implementation
@@ -144,11 +143,11 @@ AUC: 0.8557 ± 0.0267
 AUC-PR: 0.8027 ± 0.0250
 ```
 
-### 2. RIT Models (Static + Last + Learned Temporal Representation)
+### 2. PIT Models (Static + Last + Learned Temporal Representation)
 
 These models augment baselines with learned latent representations from irregular temporal sequences.
 
-#### CatBoost + RIT
+#### CatBoost + PIT
 
 ```bash
 python CatBoostRL.py
@@ -177,7 +176,7 @@ Final Test AUC: 0.8499 ± 0.0294
 Final Test AUPR: 0.7875 ± 0.0500
 ```
 
-#### XGBoost + RIT
+#### XGBoost + PIT
 
 ```bash
 python XGRL.py
@@ -194,7 +193,7 @@ Final Test AUC: 0.8397 ± 0.0240
 Final Test AUPR: 0.7724 ± 0.0390
 ```
 
-#### TabPFN + RIT
+#### TabPFN + PIT
 
 ```bash
 python TabPFNRL.py
@@ -391,7 +390,7 @@ Rank   Temporal Feature              Gradient Attribution
   - This captures **temporal patterns** invisible to last values
 
 - **Latent Z0** encodes **metabolic derangement**:
-  - Min anion gap, blood glucose (DKA severity)
+  - Min anion gap, blood glucose (DKA sevePITy)
   - Min serum creatinine (renal stress trajectory)
   - Max bicarbonate (acidosis resolution)
   - This captures **biochemical evolution** over time
@@ -400,15 +399,15 @@ Rank   Temporal Feature              Gradient Attribution
 
 ### Performance Improvements
 
-RIT consistently improves all classifiers:
+PIT consistently improves all classifiers:
 
 - **CatBoost**: +3.9% AUC-ROC (largest gain)
 - **XGBoost**: +2.8% AUC-ROC
 - **TabPFN**: +1.0% AUC-ROC (best absolute performance)
 
-TabPFN baseline is already strong (0.8557), leaving less room for improvement, but RIT still helps.
+TabPFN baseline is already strong (0.8557), leaving less room for improvement, but PIT still helps.
 
-### Why RIT Works
+### Why PIT Works
 
 1. **Captures Temporal Volatility**: Std of HR, BP not visible in last values
 2. **Encodes Trajectories**: Rising vs. falling biomarkers (BUN, SCr)
@@ -420,7 +419,7 @@ TabPFN baseline is already strong (0.8557), leaving less room for improvement, b
 From SHAP + latent interpretation:
 
 - **Weight** (obesity) is the strongest predictor (BMI → 3× kidney disease risk)
-- **OASIS, SAPS-II, SOFA** capture illness severity and hemodynamic instability
+- **OASIS, SAPS-II, SOFA** capture illness sevePITy and hemodynamic instability
 - **Age** reflects reduced renal reserve and diabetic nephropathy
 - **Latent Z11** captures hemodynamic volatility (BP/HR variability)
 - **Latent Z0** captures DKA metabolic trajectory (anion gap, glucose evolution)
@@ -507,7 +506,7 @@ python CatBoostBase.py
 python XGBase.py
 python TabPFNBase.py
 
-# Step 2: Run RIT models
+# Step 2: Run PIT models
 python CatBoostRL.py
 python XGRL.py
 python TabPFNRL.py
@@ -525,7 +524,7 @@ For detailed methodology, theoretical background, and clinical interpretation, p
 **LaTeX Template:** `\documentclass[journal]{IEEEtran}`
 
 The paper includes:
-- Complete mathematical formulation of RIT
+- Complete mathematical formulation of PIT
 - Detailed ablation studies
 - SHAP-based case study analysis
 - Clinical interpretation of latent factors
@@ -536,7 +535,7 @@ The paper includes:
 If you use this code, please cite:
 
 ```bibtex
-@article{nguyen2024rit,
+@article{nguyen2024PIT,
   title={Reinforcement Learning for Irregular Temporal Data: A Framework for Accurately Predicting Acute Kidney Injury in Diabetic Ketoacidosis},
   author={Nguyen, Hong Quang and Bui, Hoang Tu and Petschner, Peter and Nguyen, Duc Anh},
   journal={IEEE Journal of Biomedical and Health Informatics},
@@ -554,7 +553,7 @@ If you use this code, please cite:
 
 4. **TabPFN**: Hollmann, N., et al. "TabPFN: A transformer that solves small tabular classification problems in a second." NeurIPS 2022.
 
-5. **REINFORCE**: Williams, R. J. "Simple statistical gradient-following algorithms for connectionist reinforcement learning." Machine Learning 8 (1992): 229-256.
+5. **REINFORCE**: Williams, R. J. "Simple statistical gradient-following algoPIThms for connectionist reinforcement learning." Machine Learning 8 (1992): 229-256.
 
 6. **SHAP**: Lundberg, S. M., & Lee, S. I. "A unified approach to interpreting model predictions." NeurIPS 2017.
 
