@@ -642,7 +642,7 @@ def main():
         print(f"  RL Test AUC: {fold_auc:.4f} | Test AUPR: {fold_aupr:.4f}")
 
         # BASELINE
-        print("\n  [Baseline] Standard TabPFN (Last + Static)...")
+        #print("\n  [Baseline] Standard TabPFN (Last + Static)...")
 
         df_train_temp = train_p_obj.getMeasuresBetween(
             pd.Timedelta(hours=-6), pd.Timedelta(hours=24), "last", getUntilAkiPositive=True
@@ -673,37 +673,40 @@ def main():
         fpr_b, tpr_b, _ = roc_curve(y_te_b, y_prob_b)
         ax2.plot(fpr_b, tpr_b, lw=2, label=f"Fold {fold} (AUC = {baseline_auc:.3f})")
 
-        print(f"  Baseline Test AUC: {baseline_auc:.4f} | Test AUPR: {baseline_aupr:.4f}")
-        print(f"  Fold {fold} Results -> RL: {fold_auc:.3f} vs Baseline: {baseline_auc:.3f}")
+        #print(f"  Baseline Test AUC: {baseline_auc:.4f} | Test AUPR: {baseline_aupr:.4f}")
+        print(f"  Fold {fold} Results -> RL: {fold_auc:.3f}")
 
     # Final Plot
-    for ax in [ax1, ax2]:
-        ax.plot([0, 1], [0, 1], linestyle="--", color="navy", lw=2)
-        ax.set_xlim([0.0, 1.0])
-        ax.set_ylim([0.0, 1.05])
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate")
-        ax.legend(loc="lower right")
+    # for ax in [ax1, ax2]:
+    #     ax.plot([0, 1], [0, 1], linestyle="--", color="navy", lw=2)
+    #     ax.set_xlim([0.0, 1.0])
+    #     ax.set_ylim([0.0, 1.05])
+    #     ax.set_xlabel("False Positive Rate")
+    #     ax.set_ylabel("True Positive Rate")
+    #     ax.legend(loc="lower right")
 
-    ax1.set_title("RL Policy V3 + TabPFN Judge")
-    ax2.set_title("Baseline (Last + Static)")
-    plt.tight_layout()
-    plt.savefig("result/tab_rlv3_vs_baseline.png", dpi=300)
-    print("\nPlot saved to result/tab_rlv3_vs_baseline.png")
+    # ax1.set_title("RL Policy V3 + TabPFN Judge")
+    # ax2.set_title("Baseline (Last + Static)")
+    #plt.tight_layout()
+    #plt.savefig("result/tab_rlv3_vs_baseline.png", dpi=300)
+    #print("\nPlot saved to result/tab_rlv3_vs_baseline.png")
 
     print("\n" + "="*80)
     print("FINAL RESULTS SUMMARY")
     print("="*80)
 
-    def print_stat(name, rl_metrics, base_metrics):
+    def print_stat(name, rl_metrics, base_metrics=None):
         rl_mean, rl_std = np.mean(rl_metrics), np.std(rl_metrics)
-        base_mean, base_std = np.mean(base_metrics), np.std(base_metrics)
-        improvement = ((rl_mean - base_mean) / base_mean) * 100
-        symbol = "✓" if rl_mean > base_mean else "✗"
-        print(f"{name:15s} | RL: {rl_mean:.4f} ± {rl_std:.4f}  vs  Baseline: {base_mean:.4f} ± {base_std:.4f}  ({improvement:+.2f}%) {symbol}")
+        if base_metrics is not None:
+            base_mean, base_std = np.mean(base_metrics), np.std(base_metrics)
+            improvement = ((rl_mean - base_mean) / base_mean) * 100
+            symbol = "✓" if rl_mean > base_mean else "✗"
+            print(f"{name:15s} | RL: {rl_mean:.4f} ± {rl_std:.4f}  vs  Baseline: {base_mean:.4f} ± {base_std:.4f}  ({improvement:+.2f}%) {symbol}")
+        else:
+            print(f"{name:15s} | RL: {rl_mean:.4f} ± {rl_std:.4f}) {symbol}")
 
-    print_stat("AUC", metrics_rl['auc'], metrics_baseline['auc'])
-    print_stat("AUC-PR", metrics_rl['auc_pr'], metrics_baseline['auc_pr'])
+    print_stat("AUC", metrics_rl['auc'])
+    print_stat("AUC-PR", metrics_rl['auc_pr'])
 
 if __name__ == "__main__":
     main()
