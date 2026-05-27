@@ -1,40 +1,45 @@
 """
-REINFORCEMENT LEARNING V5: Fixed-Variance Policy → TabPFN Judge
+REINFORCEMENT LEARNING V3: RNN Policy Network → TabPFN Judge
 
-Key design choices:
-- Policy network outputs ONLY the mean; variance is fixed at 1.0 (scaled by
-  temperature).  This removes noisy learned-std that RL could not optimise.
-- Adaptive RL guard: revert to pretrained weights if RL degrades performance.
-- Enriched temporal statistics (last/mean/std/min/max/slope) instead of last-only.
-- Feature selection via mutual information (top-80).
-- Pretrained/RL ensemble blend when RL improves performance.
-- TabPFN with n_estimators=16.
+Goal: Beat baseline on BOTH AUC and AUPR
 
-Shared building blocks (SimpleStaticEncoder, HybridDataset, hybrid_collate_fn,
-select_features_mi) live in utils/rl_common.py.
+Key improvements over V2:
+1. Enhanced Pretraining: Better initialization with longer training
+2. AUPR-Focused Rewards: Directly optimize AUPR metric
+3. Conservative RL: Lower temperature, smaller learning rate
+4. Feature Enrichment: Add more temporal statistics beyond last value
+5. Ensemble Sampling: Multiple policy samples for robustness
 """
 
-import sys
-import os
-import copy
-import math
+import pandas as pd
 import numpy as np
+import sys
+import copy
 from matplotlib import pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import torch.distributions as dist
+from torch.utils.data import Dataset, DataLoader
 import random
+import os
+import math
 
 from sklearn.metrics import (
-    roc_auc_score, roc_curve,
-    precision_recall_curve, average_precision_score, auc,
+    accuracy_score,
+    recall_score,
+    precision_score,
     confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+    precision_recall_curve,
+    average_precision_score,
+    auc,
 )
 
-os.environ["SEGMENT_WRITE_KEY"]          = ""
-os.environ["ANALYTICS_WRITE_KEY"]        = ""
-os.environ["TABPFN_DISABLE_ANALYTICS"]   = "1"
+os.environ["SEGMENT_WRITE_KEY"] = ""
+os.environ["ANALYTICS_WRITE_KEY"] = ""
+os.environ["TABPFN_DISABLE_ANALYTICS"] = "1"
 
 try:
     import analytics
@@ -45,84 +50,219 @@ except Exception:
 
 from tabpfn import TabPFNClassifier
 
-PT = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(PT)
-
-from utils.rl_common import (
-    FIXED_FEATURES, seed_everything,
-    SimpleStaticEncoder, HybridDataset, hybrid_collate_fn,
-    select_features_mi,
-)
-from TimeEmbedding import DEVICE, TimeEmbeddedRNNCell
-from TimeEmbeddingVal import (
-    get_all_temporal_features, extract_temporal_data,
-    load_and_prepare_patients, split_patients_train_val,
-)
-from utils.prepare_data import trainTestPatients
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 xseed = 42
 seed_everything(xseed)
 
+PT = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(PT)
+
+from constants import NULLABLE_MEASURES
+from utils.class_patient import Patients
+from utils.prepare_data import trainTestPatients, encodeCategoricalData
+from TimeEmbeddingVal import (
+    get_all_temporal_features,
+    extract_temporal_data,
+    load_and_prepare_patients,
+    split_patients_train_val,
+)
+from TimeEmbedding import DEVICE, TimeEmbeddedRNNCell
+
+FIXED_FEATURES = [
+    "age", "gender", "race", "chronic_pulmonary_disease", "ckd_stage",
+    "congestive_heart_failure", "dka_type", "history_aci", "history_ami",
+    "hypertension", "liver_disease", "macroangiopathy", "malignant_cancer",
+    "microangiopathy", "uti", "oasis", "saps2", "sofa",
+    "mechanical_ventilation", "use_NaHCO3", "preiculos", "gcs_unable"
+]
 
 # ==============================================================================
-# RNN Policy Network — Fixed Unit Variance
+# 1. Static Encoder
+# ==============================================================================
+
+class SimpleStaticEncoder:
+    """Encodes categorical static features"""
+    def __init__(self, features):
+        self.features = features
+        self.mappings = {f: {} for f in features}
+        self.counts = {f: 0 for f in features}
+
+    def fit(self, patients):
+        for p in patients:
+            for f in self.features:
+                val = p.measures.get(f, 0.0)
+                if hasattr(val, 'values') and len(val) > 0:
+                    val = list(val.values())[0]
+                elif hasattr(val, 'values'):
+                    val = 0.0
+
+                val_str = str(val)
+                try:
+                    float(val)
+                except ValueError:
+                    if val_str not in self.mappings[f]:
+                        self.mappings[f][val_str] = float(self.counts[f])
+                        self.counts[f] += 1
+
+    def transform(self, patient):
+        vec = []
+        for f in self.features:
+            val = patient.measures.get(f, 0.0)
+            if hasattr(val, 'values') and len(val) > 0:
+                val = list(val.values())[0]
+            elif hasattr(val, 'values'):
+                val = 0.0
+
+            try:
+                numeric_val = float(val)
+            except ValueError:
+                numeric_val = self.mappings[f].get(str(val), -1.0)
+            vec.append(numeric_val)
+        return vec
+
+# ==============================================================================
+# 2. Dataset
+# ==============================================================================
+
+class HybridDataset(Dataset):
+    def __init__(self, patients, feature_names, static_encoder, normalization_stats=None):
+        self.data = []
+        self.labels = []
+        self.static_data = []
+        self.feature_names = feature_names
+
+        all_values = []
+        patient_list = patients.patientList if hasattr(patients, 'patientList') else patients
+
+        for patient in patient_list:
+            times, values, masks = extract_temporal_data(patient, feature_names)
+            if times is None:
+                continue
+
+            s_vec = static_encoder.transform(patient)
+            self.static_data.append(torch.tensor(s_vec, dtype=torch.float32))
+            self.data.append({'times': times, 'values': values, 'masks': masks})
+            self.labels.append(1 if patient.akdPositive else 0)
+
+            for v_vec, m_vec in zip(values, masks):
+                for v, m in zip(v_vec, m_vec):
+                    if m > 0:
+                        all_values.append(v)
+
+        if normalization_stats is None:
+            all_values = np.array(all_values)
+            self.mean = np.mean(all_values) if len(all_values) > 0 else 0.0
+            self.std = np.std(all_values) if len(all_values) > 0 else 1.0
+        else:
+            self.mean = normalization_stats['mean']
+            self.std = normalization_stats['std']
+
+        for i in range(len(self.data)):
+            norm_values = []
+            for v_vec, m_vec in zip(self.data[i]['values'], self.data[i]['masks']):
+                norm = [(v - self.mean)/self.std if m>0 else 0.0
+                        for v, m in zip(v_vec, m_vec)]
+                norm_values.append(norm)
+
+            self.data[i] = {
+                'times': torch.tensor(self.data[i]['times'], dtype=torch.float32),
+                'values': torch.tensor(norm_values, dtype=torch.float32),
+                'masks': torch.tensor(self.data[i]['masks'], dtype=torch.float32)
+            }
+
+    def get_normalization_stats(self):
+        return {'mean': self.mean, 'std': self.std}
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx], self.static_data[idx]
+
+def hybrid_collate_fn(batch):
+    data_list, label_list, static_list = zip(*batch)
+    lengths = [len(d['times']) for d in data_list]
+    max_len = max(lengths)
+    feat_dim = data_list[0]['values'].shape[-1]
+    batch_size = len(data_list)
+
+    padded_times = torch.zeros(batch_size, max_len)
+    padded_values = torch.zeros(batch_size, max_len, feat_dim)
+    padded_masks = torch.zeros(batch_size, max_len, feat_dim)
+
+    for i, d in enumerate(data_list):
+        l = lengths[i]
+        padded_times[i, :l] = d['times']
+        padded_values[i, :l] = d['values']
+        padded_masks[i, :l] = d['masks']
+
+    temporal_batch = {
+        'times': padded_times,
+        'values': padded_values,
+        'masks': padded_masks,
+        'lengths': torch.tensor(lengths)
+    }
+    return temporal_batch, torch.tensor(label_list, dtype=torch.float32), torch.stack(static_list)
+
+# ==============================================================================
+# 3. RNN Policy Network
 # ==============================================================================
 
 class RNNPolicyNetwork(nn.Module):
-    """RNN policy that outputs ONLY the mean; variance is fixed at 1.0.
-
-    During stochastic mode: z = mean + temperature * ε, ε ~ N(0, I)
-    During deterministic mode: z = mean
-
-    The fixed variance removes the noisy learned log-std and simplifies the
-    REINFORCE gradient to a pure mean-update signal.
-    """
-
+    """RNN with Gaussian policy"""
     def __init__(self, input_dim, hidden_dim, latent_dim, time_dim=32):
         super().__init__()
-        self.rnn_cell   = TimeEmbeddedRNNCell(input_dim, hidden_dim, time_dim)
-        self.fc_mean    = nn.Linear(hidden_dim, latent_dim)
+        self.rnn_cell = TimeEmbeddedRNNCell(input_dim, hidden_dim, time_dim)
+
+        # Output mean and log_std for Gaussian policy
+        self.fc_mean = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logstd = nn.Linear(hidden_dim, latent_dim)
+
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
 
-    def forward(self, batch_data, deterministic=False, temperature=0.05):
-        """
-        Returns
-        -------
-        z        : sampled (or mean) latent vector  [batch, latent_dim]
-        log_prob : per-sample log-probability       [batch]  (None if deterministic)
-        mean     : distribution mean                [batch, latent_dim]
-        """
-        times   = batch_data["times"].to(DEVICE)
-        values  = batch_data["values"].to(DEVICE)
-        masks   = batch_data["masks"].to(DEVICE)
-        lengths = batch_data["lengths"].to(DEVICE)
+    def forward(self, batch_data, deterministic=False, temperature=1.0):
+        times = batch_data['times'].to(DEVICE)
+        values = batch_data['values'].to(DEVICE)
+        masks = batch_data['masks'].to(DEVICE)
+        lengths = batch_data['lengths'].to(DEVICE)
 
-        h    = self.rnn_cell(times, values, masks, lengths)
+        h = self.rnn_cell(times, values, masks, lengths)
+
         mean = self.fc_mean(h)
+        log_std = self.fc_logstd(h)
+        log_std = torch.clamp(log_std, min=-20, max=2)
+        std = torch.exp(log_std) * temperature
+
+        policy_dist = dist.Normal(mean, std)
 
         if deterministic:
-            return mean, None, mean
+            z = mean
+            log_prob = None
+        else:
+            z = policy_dist.rsample()
+            log_prob = policy_dist.log_prob(z).sum(dim=-1)
 
-        eps      = torch.randn_like(mean)
-        z        = mean + temperature * eps
-        diff     = z.detach() - mean
-        log_prob = -0.5 * (diff ** 2).sum(dim=-1) / (temperature ** 2)
         return z, log_prob, mean
 
-
-# ==============================================================================
-# Supervised Classification Head (used during pretraining)
-# ==============================================================================
-
 class SupervisedHead(nn.Module):
+    """Enhanced supervised head with residual connection"""
     def __init__(self, input_dim, hidden_dim=128):
         super().__init__()
-        self.fc1     = nn.Linear(input_dim, hidden_dim)
-        self.bn1     = nn.BatchNorm1d(hidden_dim)
-        self.fc2     = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.bn2     = nn.BatchNorm1d(hidden_dim // 2)
-        self.fc3     = nn.Linear(hidden_dim // 2, 1)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
+        self.fc3 = nn.Linear(hidden_dim // 2, 1)
         self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
@@ -132,14 +272,13 @@ class SupervisedHead(nn.Module):
         x = self.dropout(x)
         return torch.sigmoid(self.fc3(x))
 
-
 # ==============================================================================
-# Enhanced Pretraining
+# 4. Enhanced Pretraining
 # ==============================================================================
 
 def pretrain_rnn_enhanced(policy_net, train_loader, val_loader, epochs=50):
-    """Supervised pretraining to give the RNN a good starting point."""
-    print("  [Pretraining] Supervised warm-up...")
+    """Enhanced pretraining with better architecture and longer training"""
+    print("  [Enhanced Pretraining] Longer supervised learning...")
 
     supervised_head = SupervisedHead(
         policy_net.latent_dim + len(FIXED_FEATURES)
@@ -147,17 +286,17 @@ def pretrain_rnn_enhanced(policy_net, train_loader, val_loader, epochs=50):
 
     optimizer = torch.optim.Adam(
         list(policy_net.parameters()) + list(supervised_head.parameters()),
-        lr=0.001,
+        lr=0.001
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5
+        optimizer, mode='max', factor=0.5, patience=5
     )
     criterion = nn.BCELoss()
 
-    best_aupr  = 0.0
+    best_auc = 0
     best_state = None
-    patience   = 12
-    counter    = 0
+    patience = 12
+    counter = 0
 
     for epoch in range(epochs):
         policy_net.train()
@@ -166,37 +305,45 @@ def pretrain_rnn_enhanced(policy_net, train_loader, val_loader, epochs=50):
         for t_data, labels, s_data in train_loader:
             labels = labels.to(DEVICE)
             s_data = s_data.to(DEVICE)
+
             z, _, _ = policy_net(t_data, deterministic=True)
-            preds   = supervised_head(torch.cat([z, s_data], dim=1)).squeeze(-1)
-            loss    = criterion(preds, labels)
+            combined = torch.cat([z, s_data], dim=1)
+
+            preds = supervised_head(combined).squeeze(-1)
+            loss = criterion(preds, labels)
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(policy_net.parameters()) + list(supervised_head.parameters()),
-                max_norm=1.0,
+                max_norm=1.0
             )
             optimizer.step()
 
+        # Validation
         if (epoch + 1) % 3 == 0:
             policy_net.eval()
             supervised_head.eval()
             all_preds, all_labels = [], []
+
             with torch.no_grad():
                 for t_data, labels, s_data in val_loader:
                     s_data = s_data.to(DEVICE)
                     z, _, _ = policy_net(t_data, deterministic=True)
-                    preds   = supervised_head(torch.cat([z, s_data], dim=1)).squeeze(-1)
+                    combined = torch.cat([z, s_data], dim=1)
+                    preds = supervised_head(combined).squeeze(-1)
                     all_preds.extend(preds.cpu().numpy())
                     all_labels.extend(labels.numpy())
 
             val_aupr = average_precision_score(all_labels, all_preds)
             scheduler.step(val_aupr)
+
             print(f"    Pretrain Epoch {epoch+1} | Val AUPR: {val_aupr:.4f}")
 
-            if val_aupr > best_aupr:
-                best_aupr  = val_aupr
+            if val_aupr > best_auc:
+                best_auc = val_aupr
                 best_state = copy.deepcopy(policy_net.state_dict())
-                counter    = 0
+                counter = 0
             else:
                 counter += 1
                 if counter >= patience:
@@ -204,378 +351,359 @@ def pretrain_rnn_enhanced(policy_net, train_loader, val_loader, epochs=50):
 
     if best_state is not None:
         policy_net.load_state_dict(best_state)
-    print(f"  [Pretraining] Done. Best Val AUPR: {best_aupr:.4f}")
+
+    print(f"  [Enhanced Pretraining] Completed. Best Val AUPR: {best_auc:.4f}")
     return policy_net
 
-
 # ==============================================================================
-# Enriched Feature Extraction
+# 5. Feature Extraction with Enriched Temporal Features
 # ==============================================================================
 
-def extract_enriched_features_and_logprobs(
-    policy_net, loader, deterministic=False, temperature=1.0
-):
-    """Extract [Static + Last + Mean + Std + Min + Max + Slope + Z] features.
-
-    The six temporal statistics per feature replace the last-value-only
-    representation used in XGRL / CatBoostRL, giving TabPFN richer signal.
+def extract_enriched_features_and_logprobs(policy_net, loader, deterministic=False, temperature=1.0):
     """
-    if deterministic:
-        policy_net.eval()
-    else:
-        policy_net.train()
+    Extract enriched features: [Static + Last + Mean + Std + Z]
+    Adds more temporal statistics
+    """
+    policy_net.eval() if deterministic else policy_net.train()
 
-    all_features  = []
-    all_labels    = []
+    all_features = []
+    all_labels = []
     all_log_probs = []
 
     with torch.set_grad_enabled(not deterministic):
         for t_data, labels, s_data in loader:
-            z, log_prob, mean = policy_net(
-                t_data, deterministic=deterministic, temperature=temperature
-            )
+            z, log_prob, mean = policy_net(t_data, deterministic=deterministic, temperature=temperature)
             z_np = (mean if deterministic else z).detach().cpu().numpy()
 
-            vals  = t_data["values"].cpu().numpy()
-            masks = t_data["masks"].cpu().numpy()
-            n_feats = vals.shape[2]
+            vals = t_data['values'].cpu().numpy()
+            masks = t_data['masks'].cpu().numpy()
 
-            batch_stats = {k: [] for k in ["last", "mean", "std", "min", "max", "slope"]}
+            batch_last_vals = []
+            batch_mean_vals = []
+            batch_std_vals = []
 
             for i in range(len(vals)):
-                row = {k: [] for k in batch_stats}
-                for f_idx in range(n_feats):
-                    f_vals    = vals[i, :, f_idx]
-                    f_mask    = masks[i, :, f_idx]
-                    valid_idx = np.where(f_mask > 0)[0]
-                    if len(valid_idx) > 0:
-                        vv = f_vals[valid_idx]
-                        row["last"].append(vv[-1])
-                        row["mean"].append(np.mean(vv))
-                        row["std"].append(np.std(vv) if len(vv) > 1 else 0.0)
-                        row["min"].append(np.min(vv))
-                        row["max"].append(np.max(vv))
-                        row["slope"].append(vv[-1] - vv[0] if len(vv) > 1 else 0.0)
-                    else:
-                        for k in row:
-                            row[k].append(0.0)
-                for k in batch_stats:
-                    batch_stats[k].append(row[k])
+                patient_last = []
+                patient_mean = []
+                patient_std = []
 
+                for f_idx in range(vals.shape[2]):
+                    f_vals = vals[i, :, f_idx]
+                    f_mask = masks[i, :, f_idx]
+                    valid_idx = np.where(f_mask > 0)[0]
+
+                    if len(valid_idx) > 0:
+                        valid_vals = f_vals[valid_idx]
+                        patient_last.append(valid_vals[-1])
+                        patient_mean.append(np.mean(valid_vals))
+                        patient_std.append(np.std(valid_vals) if len(valid_vals) > 1 else 0.0)
+                    else:
+                        patient_last.append(0.0)
+                        patient_mean.append(0.0)
+                        patient_std.append(0.0)
+
+                batch_last_vals.append(patient_last)
+                batch_mean_vals.append(patient_mean)
+                batch_std_vals.append(patient_std)
+
+            last_vals_arr = np.array(batch_last_vals)
+            mean_vals_arr = np.array(batch_mean_vals)
+            std_vals_arr = np.array(batch_std_vals)
             s_np = s_data.numpy()
-            combined = np.hstack(
-                [s_np]
-                + [np.array(batch_stats[k]) for k in ["last", "mean", "std", "min", "max", "slope"]]
-                + [z_np]
-            )
+
+            # Enriched concatenation: [Static + Last + Mean + Std + Z]
+            combined = np.hstack([s_np, last_vals_arr, mean_vals_arr, std_vals_arr, z_np])
+
             all_features.append(combined)
             all_labels.extend(labels.numpy())
 
             if not deterministic and log_prob is not None:
                 all_log_probs.append(log_prob)
 
-    features  = np.vstack(all_features)
-    labels    = np.array(all_labels)
+    features = np.vstack(all_features)
+    labels = np.array(all_labels)
     log_probs = torch.cat(all_log_probs) if all_log_probs else None
 
     return features, labels, log_probs
 
-
 # ==============================================================================
-# TabPFN Evaluation
-# ==============================================================================
-
-def evaluate_with_tabpfn(policy_net, train_loader, val_loader, tabpfn_params, feat_indices=None):
-    policy_net.eval()
-    with torch.no_grad():
-        X_train, y_train, _ = extract_enriched_features_and_logprobs(
-            policy_net, train_loader, deterministic=True
-        )
-        X_val, y_val, _ = extract_enriched_features_and_logprobs(
-            policy_net, val_loader, deterministic=True
-        )
-
-    if feat_indices is not None:
-        X_train = X_train[:, feat_indices]
-        X_val   = X_val[:, feat_indices]
-
-    model = TabPFNClassifier(**tabpfn_params)
-    model.fit(X_train, y_train)
-    y_proba = model.predict_proba(X_val)[:, 1]
-
-    val_auc  = roc_auc_score(y_val, y_proba)
-    val_aupr = average_precision_score(y_val, y_proba)
-    return val_auc, val_aupr
-
-
-# ==============================================================================
-# Adaptive RL Training
+# 6. Conservative RL Training
 # ==============================================================================
 
-def train_policy_adaptive_rl(
+def train_policy_conservative_rl(
     policy_net,
     train_loader,
     val_loader,
     tabpfn_params,
-    epochs=40,
-    update_tabpfn_every=5,
-    top_k_features=80,
+    epochs=80,
+    update_tabpfn_every=5
 ):
-    """RL fine-tuning with adaptive guard: reverts if RL degrades performance.
-
-    Returns
-    -------
-    policy_net   : trained (or reverted) policy
-    feat_indices : MI-selected feature indices
-    was_reverted : bool — True if the pretrained weights were restored
     """
-    pre_rl_state = copy.deepcopy(policy_net.state_dict())
+    Conservative RL: smaller updates, lower temperature, AUPR-focused
+    """
 
-    policy_net.eval()
-    with torch.no_grad():
-        X_train_pre, y_train_pre, _ = extract_enriched_features_and_logprobs(
-            policy_net, train_loader, deterministic=True
-        )
-        X_val_pre, y_val_pre, _ = extract_enriched_features_and_logprobs(
-            policy_net, val_loader, deterministic=True
-        )
+    optimizer = torch.optim.Adam(policy_net.parameters(), lr=0.0001)  # Lower LR
 
-    _, _, feat_indices = select_features_mi(
-        X_train_pre, y_train_pre, X_val_pre, top_k=top_k_features
-    )
+    best_val_auc = 0
+    best_state = None
+    patience = 25
+    patience_counter = 0
 
-    pre_rl_auc, pre_rl_aupr = evaluate_with_tabpfn(
-        policy_net, train_loader, val_loader, tabpfn_params, feat_indices
-    )
-    print(f"  [Pre-RL Baseline] AUC: {pre_rl_auc:.4f} | AUPR: {pre_rl_aupr:.4f}")
-
-    optimizer  = torch.optim.Adam(policy_net.parameters(), lr=5e-5)
-    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-    best_val_aupr      = pre_rl_aupr
-    best_state         = copy.deepcopy(policy_net.state_dict())
-    patience           = 15
-    patience_counter   = 0
-    degradation_counter = 0
-
-    print("  [Adaptive RL] Fixed-variance policy, AUPR-focused...")
+    print("  [Conservative RL] AUPR-focused training with lower exploration...")
 
     tabpfn_model = None
 
     for epoch in range(epochs):
-        temperature = max(0.3, 0.7 - epoch / (epochs * 0.8))
+        # Very conservative temperature annealing
+        temperature = max(0.3, 0.8 - epoch / (epochs * 0.7))
 
         policy_net.train()
+
+        # Sample features
         X_train, y_train, log_probs_train = extract_enriched_features_and_logprobs(
             policy_net, train_loader, deterministic=False, temperature=temperature
         )
-        X_train_sel = X_train[:, feat_indices]
 
+        # Train TabPFN
         if epoch % update_tabpfn_every == 0 or tabpfn_model is None:
             tabpfn_model = TabPFNClassifier(**tabpfn_params)
-            tabpfn_model.fit(X_train_sel, y_train)
+            tabpfn_model.fit(X_train, y_train)
 
-        y_train_proba = tabpfn_model.predict_proba(X_train_sel)[:, 1]
-
-        rewards = np.where(
-            (y_train == 1) & (y_train_proba > 0.5), y_train_proba * 2.0,
-            np.where(
-                y_train == 1, y_train_proba * 0.5,
-                np.where(y_train_proba < 0.5, 1 - y_train_proba, (1 - y_train_proba) * 0.5),
-            ),
+        # AUPR-focused rewards
+        X_val_stoch, y_val, _ = extract_enriched_features_and_logprobs(
+            policy_net, val_loader, deterministic=False, temperature=temperature
         )
 
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(DEVICE)
+        y_val_proba = tabpfn_model.predict_proba(X_val_stoch)[:, 1]
+        val_aupr = average_precision_score(y_val, y_val_proba)
+
+        # Per-sample probability quality
+        y_train_proba = tabpfn_model.predict_proba(X_train)[:, 1]
+        rewards_smooth = np.where(y_train == 1, y_train_proba, 1 - y_train_proba)
+
+        # Heavily weight AUPR (this is the key!)
+        rewards_combined = rewards_smooth + 0.5 * val_aupr  # Increased from 0.3
+
+        # Normalize
+        rewards_tensor = torch.tensor(rewards_combined, dtype=torch.float32).to(DEVICE)
         rewards_tensor = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
 
+        # Policy update
         log_probs_train = log_probs_train.to(DEVICE)
-        policy_loss     = -(log_probs_train * rewards_tensor).mean()
+        policy_loss = -(log_probs_train * rewards_tensor).mean()
+
+        # Minimal entropy (trust the good initialization)
+        entropy_bonus = 0.001 * log_probs_train.mean()
+
+        total_loss = policy_loss - entropy_bonus
 
         optimizer.zero_grad()
-        policy_loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=0.3)
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=0.5)  # Smaller gradients
         optimizer.step()
-        scheduler.step()
 
+        # Validation
         if (epoch + 1) % 5 == 0:
-            val_auc, val_aupr = evaluate_with_tabpfn(
-                policy_net, train_loader, val_loader, tabpfn_params, feat_indices
-            )
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"    Epoch {epoch+1:3d} | Temp: {temperature:.3f} | LR: {current_lr:.2e} | "
-                  f"Val AUC: {val_auc:.4f} | Val AUPR: {val_aupr:.4f}")
+            policy_net.eval()
+            with torch.no_grad():
+                X_val_det, y_val_det, _ = extract_enriched_features_and_logprobs(
+                    policy_net, val_loader, deterministic=True
+                )
 
-            if val_aupr > best_val_aupr:
-                best_val_aupr       = val_aupr
-                best_state          = copy.deepcopy(policy_net.state_dict())
-                patience_counter    = 0
-                degradation_counter = 0
-            else:
-                patience_counter += 1
-                if val_aupr < pre_rl_aupr - 0.005:
-                    degradation_counter += 1
-                    if degradation_counter >= 3:
-                        print("    RL degrading below pretrained. Reverting.")
-                        policy_net.load_state_dict(pre_rl_state)
-                        return policy_net, feat_indices, True
+                X_train_det, y_train_det, _ = extract_enriched_features_and_logprobs(
+                    policy_net, train_loader, deterministic=True
+                )
+
+                tabpfn_val_model = TabPFNClassifier(**tabpfn_params)
+                tabpfn_val_model.fit(X_train_det, y_train_det)
+
+                y_val_proba_det = tabpfn_val_model.predict_proba(X_val_det)[:, 1]
+
+                val_auc = roc_auc_score(y_val_det, y_val_proba_det)
+                val_aupr_det = average_precision_score(y_val_det, y_val_proba_det)
+
+                print(f"    Epoch {epoch+1:3d} | Temp: {temperature:.3f} | "
+                      f"Val AUC: {val_auc:.4f} | Val AUPR: {val_aupr_det:.4f}")
+
+                # Early stopping on AUPR
+                if val_aupr_det > best_val_auc:
+                    best_val_auc = val_aupr_det
+                    best_state = copy.deepcopy(policy_net.state_dict())
+                    patience_counter = 0
                 else:
-                    degradation_counter = 0
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f"    Early stopping at epoch {epoch+1}")
+                        break
 
-                if patience_counter >= patience:
-                    print(f"    Early stopping at epoch {epoch+1}")
-                    break
-
-    if best_val_aupr > pre_rl_aupr:
+    if best_state is not None:
         policy_net.load_state_dict(best_state)
-        print(f"  [RL] Best AUPR: {best_val_aupr:.4f} (pre-RL: {pre_rl_aupr:.4f})")
-        return policy_net, feat_indices, False
-    else:
-        policy_net.load_state_dict(pre_rl_state)
-        print(f"  [RL] No improvement. Reverted to pretrained (pre-RL: {pre_rl_aupr:.4f})")
-        return policy_net, feat_indices, True
 
+    return policy_net
 
 # ==============================================================================
-# Main
+# 7. Main Execution
 # ==============================================================================
 
 def main():
-    print("=" * 80)
-    print("RL POLICY V5 (Fixed Variance + Adaptive) — TabPFN Judge")
-    print("=" * 80)
+    print("="*80)
+    print("RL POLICY V3 (Enhanced) vs BASELINE")
+    print("="*80)
 
-    patients       = load_and_prepare_patients()
+    patients = load_and_prepare_patients()
     temporal_feats = get_all_temporal_features(patients)
 
+    print("Encoding static features...")
     encoder = SimpleStaticEncoder(FIXED_FEATURES)
     encoder.fit(patients.patientList)
+
     print(f"Input: {len(temporal_feats)} Temporal + {len(FIXED_FEATURES)} Static Features")
 
-    metrics_rl    = {k: [] for k in ["auc", "auc_pr"]}
-    reverted_folds = []
+    metrics_rl = {k: [] for k in ['auc', 'auc_pr']}
+    metrics_baseline = {k: [] for k in ['auc', 'auc_pr']}
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
     for fold, (train_full, test_p) in enumerate(trainTestPatients(patients, seed=xseed)):
-        print(f"\n{'='*80}\nFold {fold}\n{'='*80}")
+        print(f"\n{'='*80}")
+        print(f"Fold {fold}")
+        print('='*80)
 
-        train_p_obj, val_p_obj = split_patients_train_val(train_full, val_ratio=0.1, seed=42 + fold)
-        train_p     = train_p_obj.patientList
-        val_p       = val_p_obj.patientList
+        train_p_obj, val_p_obj = split_patients_train_val(train_full, val_ratio=0.1, seed=42+fold)
+        train_p = train_p_obj.patientList
+        val_p = val_p_obj.patientList
         test_p_list = test_p.patientList
 
-        train_ds = HybridDataset(train_p,       temporal_feats, encoder)
-        stats    = train_ds.get_normalization_stats()
-        val_ds   = HybridDataset(val_p,          temporal_feats, encoder, stats)
-        test_ds  = HybridDataset(test_p_list,    temporal_feats, encoder, stats)
+        train_ds = HybridDataset(train_p, temporal_feats, encoder)
+        stats = train_ds.get_normalization_stats()
+        val_ds = HybridDataset(val_p, temporal_feats, encoder, stats)
+        test_ds = HybridDataset(test_p_list, temporal_feats, encoder, stats)
 
-        train_loader = DataLoader(train_ds, batch_size=32, shuffle=True,  collate_fn=hybrid_collate_fn)
-        val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False, collate_fn=hybrid_collate_fn)
-        test_loader  = DataLoader(test_ds,  batch_size=32, shuffle=False, collate_fn=hybrid_collate_fn)
+        train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, collate_fn=hybrid_collate_fn)
+        val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, collate_fn=hybrid_collate_fn)
+        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=hybrid_collate_fn)
 
-        latent_dim = 12
+        # Larger capacity
+        latent_dim = 28
         policy_net = RNNPolicyNetwork(
-            input_dim=len(temporal_feats), hidden_dim=64,
-            latent_dim=latent_dim, time_dim=32,
+            input_dim=len(temporal_feats),
+            hidden_dim=20,
+            latent_dim=latent_dim,
+            time_dim=32
         ).to(DEVICE)
 
         tabpfn_params = {
-            "device":       "cuda" if torch.cuda.is_available() else "cpu",
-            "n_estimators": 16,
+            'device': 'cuda' if torch.cuda.is_available() else 'cpu'
         }
 
-        # Step 1: Enhanced pretraining
+        # STEP 1: Enhanced Pretraining (longer)
         policy_net = pretrain_rnn_enhanced(policy_net, train_loader, val_loader, epochs=50)
-        pretrained_state = copy.deepcopy(policy_net.state_dict())
 
-        # Step 2: Adaptive RL fine-tuning
-        policy_net, feat_indices, was_reverted = train_policy_adaptive_rl(
-            policy_net, train_loader, val_loader, tabpfn_params,
-            epochs=40, update_tabpfn_every=5, top_k_features=80,
+        # STEP 2: Conservative RL Fine-tuning
+        policy_net = train_policy_conservative_rl(
+            policy_net,
+            train_loader,
+            val_loader,
+            tabpfn_params,
+            epochs=80,
+            update_tabpfn_every=5
         )
-        if was_reverted:
-            reverted_folds.append(fold)
 
-        # Step 3: Final evaluation with ensemble blend
+        # Final Evaluation
         print("\n  [Final Test Evaluation]")
         policy_net.eval()
+
         with torch.no_grad():
-            X_train_rl, y_train_f, _ = extract_enriched_features_and_logprobs(
+            X_train_final, y_train_final, _ = extract_enriched_features_and_logprobs(
                 policy_net, train_loader, deterministic=True
             )
-            X_test_rl, y_test_f, _ = extract_enriched_features_and_logprobs(
+            X_test_final, y_test_final, _ = extract_enriched_features_and_logprobs(
                 policy_net, test_loader, deterministic=True
             )
 
-        if not was_reverted:
-            pretrained_net = RNNPolicyNetwork(
-                input_dim=len(temporal_feats), hidden_dim=64,
-                latent_dim=latent_dim, time_dim=32,
-            ).to(DEVICE)
-            pretrained_net.load_state_dict(pretrained_state)
-            pretrained_net.eval()
-            with torch.no_grad():
-                X_train_pre, _, _ = extract_enriched_features_and_logprobs(
-                    pretrained_net, train_loader, deterministic=True
-                )
-                X_test_pre, _, _ = extract_enriched_features_and_logprobs(
-                    pretrained_net, test_loader, deterministic=True
-                )
-            X_train_f = 0.5 * X_train_pre + 0.5 * X_train_rl
-            X_test_f  = 0.5 * X_test_pre  + 0.5 * X_test_rl
-        else:
-            X_train_f = X_train_rl
-            X_test_f  = X_test_rl
-
-        X_train_sel = X_train_f[:, feat_indices]
-        X_test_sel  = X_test_f[:, feat_indices]
-
         final_tabpfn = TabPFNClassifier(**tabpfn_params)
-        final_tabpfn.fit(X_train_sel, y_train_f)
-        y_test_proba = final_tabpfn.predict_proba(X_test_sel)[:, 1]
+        final_tabpfn.fit(X_train_final, y_train_final)
 
-        prec, rec, _ = precision_recall_curve(y_test_f, y_test_proba)
-        fold_auc  = roc_auc_score(y_test_f, y_test_proba)
+        y_test_proba = final_tabpfn.predict_proba(X_test_final)[:, 1]
+        y_test_pred = (y_test_proba > 0.5).astype(int)
+
+        tn, fp, fn, tp = confusion_matrix(y_test_final, y_test_pred).ravel()
+        prec, rec, _ = precision_recall_curve(y_test_final, y_test_proba)
+
+        fold_auc = roc_auc_score(y_test_final, y_test_proba)
         fold_aupr = auc(rec, prec)
 
-        metrics_rl["auc"].append(fold_auc)
-        metrics_rl["auc_pr"].append(fold_aupr)
+        metrics_rl['auc'].append(fold_auc)
+        metrics_rl['auc_pr'].append(fold_aupr)
 
-        fpr, tpr, _ = roc_curve(y_test_f, y_test_proba)
-        ax1.plot(fpr, tpr, lw=2, label=f"Fold {fold} (AUC={fold_auc:.3f})")
+        fpr, tpr, _ = roc_curve(y_test_final, y_test_proba)
+        ax1.plot(fpr, tpr, lw=2, label=f"Fold {fold} (AUC = {fold_auc:.3f})")
 
-        print(f"  Test AUC: {fold_auc:.4f} | Test AUPR: {fold_aupr:.4f}")
+        print(f"  RL Test AUC: {fold_auc:.4f} | Test AUPR: {fold_aupr:.4f}")
 
-    ax1.plot([0, 1], [0, 1], "k--", lw=1)
-    ax1.set_xlabel("FPR"); ax1.set_ylabel("TPR")
-    ax1.set_title("ROC Curves (RL V5 — Fixed Variance)")
-    ax1.legend(fontsize=8)
+        # BASELINE
+        print("\n  [Baseline] Standard TabPFN (Last + Static)...")
 
-    n_folds = len(metrics_rl["auc_pr"])
-    ax2.bar(range(n_folds), metrics_rl["auc_pr"], alpha=0.7, label="AUPR")
-    ax2.set_xlabel("Fold"); ax2.set_ylabel("AUPR")
-    ax2.set_title("AUPR per Fold"); ax2.legend()
+        df_train_temp = train_p_obj.getMeasuresBetween(
+            pd.Timedelta(hours=-6), pd.Timedelta(hours=24), "last", getUntilAkiPositive=True
+        ).drop(columns=["subject_id", "hadm_id", "stay_id"])
+        df_test_temp = test_p.getMeasuresBetween(
+            pd.Timedelta(hours=-6), pd.Timedelta(hours=24), "last", getUntilAkiPositive=True
+        ).drop(columns=["subject_id", "hadm_id", "stay_id"])
 
+        df_train_enc, df_test_enc, _ = encodeCategoricalData(df_train_temp, df_test_temp)
+
+        X_tr_b = df_train_enc.drop(columns=["akd"]).fillna(0)
+        y_tr_b = df_train_enc["akd"]
+        X_te_b = df_test_enc.drop(columns=["akd"]).fillna(0)
+        y_te_b = df_test_enc["akd"]
+
+        tabpfn_base = TabPFNClassifier(**tabpfn_params)
+        tabpfn_base.fit(X_tr_b, y_tr_b)
+
+        y_prob_b = tabpfn_base.predict_proba(X_te_b)[:, 1]
+        prec_b, rec_b, _ = precision_recall_curve(y_te_b, y_prob_b)
+
+        baseline_auc = roc_auc_score(y_te_b, y_prob_b)
+        baseline_aupr = auc(rec_b, prec_b)
+
+        metrics_baseline['auc'].append(baseline_auc)
+        metrics_baseline['auc_pr'].append(baseline_aupr)
+
+        fpr_b, tpr_b, _ = roc_curve(y_te_b, y_prob_b)
+        ax2.plot(fpr_b, tpr_b, lw=2, label=f"Fold {fold} (AUC = {baseline_auc:.3f})")
+
+        print(f"  Baseline Test AUC: {baseline_auc:.4f} | Test AUPR: {baseline_aupr:.4f}")
+        print(f"  Fold {fold} Results -> RL: {fold_auc:.3f} vs Baseline: {baseline_auc:.3f}")
+
+    # Final Plot
+    for ax in [ax1, ax2]:
+        ax.plot([0, 1], [0, 1], linestyle="--", color="navy", lw=2)
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.legend(loc="lower right")
+
+    ax1.set_title("RL Policy V3 + TabPFN Judge")
+    ax2.set_title("Baseline (Last + Static)")
     plt.tight_layout()
-    os.makedirs("result", exist_ok=True)
-    plt.savefig("result/tabpfn_rl_v5.png", dpi=150)
-    plt.close()
+    plt.savefig("result/tab_rlv3_vs_baseline.png", dpi=300)
+    print("\nPlot saved to result/tab_rlv3_vs_baseline.png")
 
-    print("\n" + "=" * 80)
+    print("\n" + "="*80)
     print("FINAL RESULTS SUMMARY")
-    print("=" * 80)
+    print("="*80)
 
-    def print_stat(name, vals):
-        print(f"{name:15s} | {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+    def print_stat(name, rl_metrics, base_metrics):
+        rl_mean, rl_std = np.mean(rl_metrics), np.std(rl_metrics)
+        base_mean, base_std = np.mean(base_metrics), np.std(base_metrics)
+        improvement = ((rl_mean - base_mean) / base_mean) * 100
+        symbol = "✓" if rl_mean > base_mean else "✗"
+        print(f"{name:15s} | RL: {rl_mean:.4f} ± {rl_std:.4f}  vs  Baseline: {base_mean:.4f} ± {base_std:.4f}  ({improvement:+.2f}%) {symbol}")
 
-    print_stat("AUC",    metrics_rl["auc"])
-    print_stat("AUC-PR", metrics_rl["auc_pr"])
-
-    if reverted_folds:
-        print(f"\nFolds reverted to pretrained (RL degraded): {reverted_folds}")
-    else:
-        print("\nAll folds improved with RL.")
-
+    print_stat("AUC", metrics_rl['auc'], metrics_baseline['auc'])
+    print_stat("AUC-PR", metrics_rl['auc_pr'], metrics_baseline['auc_pr'])
 
 if __name__ == "__main__":
     main()
